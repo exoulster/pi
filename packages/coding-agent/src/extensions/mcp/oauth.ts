@@ -35,6 +35,7 @@ import lockfile from "proper-lockfile";
 import { APP_NAME, getAgentDir } from "../../config.ts";
 import { type AuthStorageBackend, FileAuthStorageBackend } from "../../core/auth-storage.ts";
 import { mcpNamespace } from "../../core/mcp-servers.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 
 const CALLBACK_HOST = "127.0.0.1";
 const CALLBACK_PATH = "/callback";
@@ -133,8 +134,8 @@ function storeKeys(name: string, serverUrl: string): { key: string; legacyKey: s
 }
 
 export interface McpOAuthServerStore extends McpOAuthStateStore {
-	/** Run `fn` while no other process refreshes the server's tokens. */
-	withRefreshLock<T>(fn: () => Promise<T>): Promise<T>;
+	/** Run `fn` while no other process refreshes the tokens. `signal` only cancels waiting for the lock. */
+	withRefreshLock<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 
 /** Per-server OAuth state (client registration, tokens, pending PKCE verifier) in `mcp-auth.json`. */
@@ -164,7 +165,7 @@ export class McpOAuthCredentialStore {
 				this.write((states) => {
 					states[key] = state;
 				}),
-			withRefreshLock: (fn) => this.withRefreshLock(key, fn),
+			withRefreshLock: (fn, signal) => this.withRefreshLock(key, fn, signal),
 		};
 	}
 
@@ -172,11 +173,12 @@ export class McpOAuthCredentialStore {
 	 * A lock file per server. When the process exits, proper-lockfile removes the locks it holds; when
 	 * it is killed, the lock goes stale because it is no longer renewed, and the next process takes it over.
 	 */
-	private async withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+	private async withRefreshLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		signal?.throwIfAborted();
 		if (!this.lockDir) return fn();
 		mkdirSync(this.lockDir, { recursive: true, mode: 0o700 });
 		const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
-		const release = await lockfile.lock(join(this.lockDir, `mcp-auth-refresh-${hash}`), {
+		const acquiring = lockfile.lock(join(this.lockDir, `mcp-auth-refresh-${hash}`), {
 			realpath: false,
 			stale: REFRESH_LOCK_STALE_MS,
 			retries: {
@@ -188,7 +190,16 @@ export class McpOAuthCredentialStore {
 			// The default throws from a timer. A lost lock at worst lets two refreshes overlap.
 			onCompromised: () => {},
 		});
+		const release = await raceWithAbortSignal(acquiring, signal).catch((error: unknown) => {
+			// proper-lockfile cannot cancel its retries. Release a lock acquired after the caller left.
+			void acquiring.then(
+				(unlock) => unlock().catch(() => undefined),
+				() => undefined,
+			);
+			throw error;
+		});
 		try {
+			signal?.throwIfAborted();
 			return await fn();
 		} finally {
 			await release().catch(() => undefined);
@@ -472,7 +483,7 @@ async function listenForCallback(
  */
 export async function signInMcpServer(options: {
 	serverUrl: string;
-	store: McpOAuthStateStore;
+	store: McpOAuthServerStore;
 	settings: McpOAuthSettings;
 	challenge?: OAuthChallenge;
 	prompt: McpSignInPrompt;
@@ -480,79 +491,113 @@ export async function signInMcpServer(options: {
 }): Promise<void> {
 	const { serverUrl, store, settings, signal } = options;
 	if (signal?.aborted) throw new McpSignInCancelledError();
-	const stored = await store.load();
+	const observed = await store.load();
 	const stepUp = options.challenge?.error === "insufficient_scope";
 	const callbackOptions = callbackSettings(settings);
-	// Reuse the port of the registered redirect URI so the registered client stays valid.
-	const registered = registeredRedirectUrls(stored?.clientInformation)[0];
-	const preferredPort =
-		callbackOptions.port ?? (registered ? Number(new URL(registered).port) || undefined : undefined);
 	const cimd = settings.clientRegistration === "cimd";
-	const callback = await listenForCallback(
-		callbackOptions,
-		// The redirect URI of a server-specific Client ID Metadata Document.
-		cimd ? [`${CALLBACK_PATH}/${callbackId(serverUrl)}`] : [],
-		preferredPort,
-		callbackOptions.port !== undefined,
-	);
-	const redirectUrl = callbackOptions.fixedRedirectUrl ?? callback.redirectUrl;
+	let callback: OAuthCallbackServer | undefined;
 	try {
-		if (stored) {
-			const next: McpOAuthState = { ...stored };
-			// Every sign-in gets a fresh `state` parameter.
-			delete next.oauthState;
-			// A registered client cannot use another redirect URI, and its tokens belong to it. A Client ID
-			// Metadata Document is not stored, so with one, a stored client was registered before and is replaced.
-			const keepClient =
-				settings.clientId ||
-				(cimd ? !stored.clientInformation : registeredRedirectUrls(stored.clientInformation).includes(redirectUrl));
-			if (!keepClient) {
-				delete next.clientInformation;
-				delete next.tokens;
-				delete next.tokensExpireAt;
+		const authorization = await store.withRefreshLock(async () => {
+			if (signal?.aborted) throw new McpSignInCancelledError();
+			const stored = await store.load();
+			const registered = registeredRedirectUrls(stored?.clientInformation)[0];
+			// Another connection or sign-in may have refreshed while we waited. Check before binding:
+			// the other sign-in may still be closing the registered callback port.
+			// Configured client identity is not stored with tokens. Let the token endpoint validate it
+			// instead of assuming another caller's replacement grant belongs to this client.
+			const compatibleClient =
+				!settings.clientId &&
+				(cimd
+					? !stored?.clientInformation
+					: registeredRedirectUrls(stored?.clientInformation).includes(
+							callbackOptions.fixedRedirectUrl ?? registered ?? "",
+						));
+			if (
+				!stepUp &&
+				compatibleClient &&
+				stored?.tokens?.access_token &&
+				(stored.tokens.access_token !== observed?.tokens?.access_token ||
+					stored.tokens.refresh_token !== observed?.tokens?.refresh_token)
+			) {
+				return undefined;
 			}
-			await store.save(next);
-		}
 
-		let authorizationUrl: URL | undefined;
-		const provider = createProvider(serverUrl, store, settings, redirectUrl, (url) => {
-			authorizationUrl = url;
-		});
-		const flow = {
-			serverUrl,
-			fetch: timedFetch(),
-			signal,
-			resourceMetadataUrl: options.challenge?.resourceMetadataUrl,
-			authorizationServerMetadataUrl: settings.authServerMetadataUrl,
-			// A server asking for more scope gets it on top of the configured scope and, since the challenge
-			// may list only the missing scopes, on top of the scope granted so far.
-			scope: mergeScopes(
-				settings.scope,
-				stepUp ? stepUpScope(stored?.tokens?.scope, options.challenge?.scope) : options.challenge?.scope,
-			),
-		};
-		// A refresh keeps the granted scope; a server asking for more needs the browser flow.
-		const skipRefresh = stepUp;
-		if ((await authorizeMcp(provider, { ...flow, skipRefresh })) === "AUTHORIZED") return;
-		if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
+			// Reuse the port of the registered redirect URI so the registered client stays valid.
+			const preferredPort =
+				callbackOptions.port ?? (registered ? Number(new URL(registered).port) || undefined : undefined);
+			callback = await listenForCallback(
+				callbackOptions,
+				// The redirect URI of a server-specific Client ID Metadata Document.
+				cimd ? [`${CALLBACK_PATH}/${callbackId(serverUrl)}`] : [],
+				preferredPort,
+				callbackOptions.port !== undefined,
+			);
+			const redirectUrl = callbackOptions.fixedRedirectUrl ?? callback.redirectUrl;
+			if (stored) {
+				const next: McpOAuthState = { ...stored };
+				// Every sign-in gets a fresh `state` parameter.
+				delete next.oauthState;
+				// A registered client cannot use another redirect URI, and its tokens belong to it. A Client ID
+				// Metadata Document is not stored, so with one, a stored client was registered before and is replaced.
+				const keepClient =
+					settings.clientId ||
+					(cimd
+						? !stored.clientInformation
+						: registeredRedirectUrls(stored.clientInformation).includes(redirectUrl));
+				if (!keepClient) {
+					delete next.clientInformation;
+					delete next.tokens;
+					delete next.tokensExpireAt;
+				}
+				await store.save(next);
+			}
 
-		const state = await provider.state();
+			let authorizationUrl: URL | undefined;
+			const provider = createProvider(serverUrl, store, settings, redirectUrl, (url) => {
+				authorizationUrl = url;
+			});
+			const flow = {
+				serverUrl,
+				fetch: timedFetch(),
+				signal,
+				resourceMetadataUrl: options.challenge?.resourceMetadataUrl,
+				authorizationServerMetadataUrl: settings.authServerMetadataUrl,
+				// A server asking for more scope gets it on top of the configured scope and, since the challenge
+				// may list only the missing scopes, on top of the scope granted so far.
+				scope: mergeScopes(
+					settings.scope,
+					stepUp ? stepUpScope(stored?.tokens?.scope, options.challenge?.scope) : options.challenge?.scope,
+				),
+			};
+			// A refresh keeps the granted scope; a server asking for more needs the browser flow.
+			if ((await authorizeMcp(provider, { ...flow, skipRefresh: stepUp })) === "AUTHORIZED") return undefined;
+			if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
+			return { provider, flow, authorizationUrl, redirectUrl, state: await provider.state(), callback };
+		}, signal);
+		if (!authorization) return;
+		const { provider, flow, authorizationUrl, redirectUrl, state } = authorization;
 		// The flow picks the redirect URI, which may be specific to the MCP server.
 		const authorizationRedirectUrl = new URL(authorizationUrl.searchParams.get("redirect_uri") ?? redirectUrl);
 		options.prompt.showAuthorizationUrl(authorizationUrl);
 		const { code, iss } = await waitForAuthorizationResponse(
-			callback,
+			authorization.callback,
 			state,
 			authorizationRedirectUrl,
 			options.prompt,
 			signal,
 		);
-		await authorizeMcp(provider, { ...flow, authorizationCode: code, iss });
+		await store.withRefreshLock(async () => {
+			if (signal?.aborted) throw new McpSignInCancelledError();
+			// Do not use a verifier from another sign-in or invalidate its newer tokens on failure.
+			if ((await store.load())?.oauthState !== state)
+				throw new Error("MCP OAuth sign-in was replaced by another sign-in");
+			await authorizeMcp(provider, { ...flow, authorizationCode: code, iss });
+		}, signal);
 	} catch (error) {
 		// Aborted requests fail with the signal's reason; report them as the cancellation they are.
 		if (signal?.aborted) throw new McpSignInCancelledError();
 		throw error;
 	} finally {
-		await callback.close();
+		await callback?.close();
 	}
 }
